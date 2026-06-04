@@ -2,13 +2,13 @@
 
 Этот репозиторий — мост к JupyterHub `jupyter.culab.ru`. У тебя нет SSH и нет sudo на сервере; ты ходишь туда через WebSocket терминал, авторизуясь экспортированными браузерными cookies (`cookies.json`).
 
-**Единственная точка входа — обёртка `./culab`.** Не запускай `python3 jupyter_terminal_exec.py`, `./remote-run` напрямую, `python3 remote_push_code.py` или `jupyter_chunk_upload.py` — это устаревший путь. Все `push-*` скрипты уже переписаны на `./culab push` и тоже пригодны.
+**Единственная точка входа — обёртка `./culab`.** Не дёргай `python3 jupyter_terminal_exec.py` напрямую и не пиши собственные WebSocket-вызовы — это устаревший путь, он зальёт твой контекст PTY-мусором.
 
 ## Когда использовать
 
 - Запустить команду на сервере → `./culab exec`.
 - Запустить долгую задачу (обучение, скачивание, билд) → `./culab spawn` + опрос.
-- Залить локальный проект (фильтр в `remote_push_code.py`) → `./culab push` или готовые `./push-*`.
+- Залить локальный проект → `./culab push LOCAL_DIR REMOTE_DIR`.
 - Прочитать файл с сервера → `./culab exec "cat /path/to/file"`.
 - Записать файл на сервер маленький → `./culab exec` + heredoc, большой → `./culab push` целого каталога.
 
@@ -42,7 +42,7 @@
 
 ## Push: что фильтруется
 
-`./culab push` берёт фильтр из `remote_push_code.py` (`should_include`):
+`./culab push` пакует только «код», фильтр зашит в `culab_rpc.py:_should_include`:
 - Включает: `*.py *.ipynb *.toml *.lock *.md *.txt *.yaml *.yml *.json *.ini *.cfg *.sh`, `.gitignore .dockerignore .python-version`, `Dockerfile Makefile`, **а также `Dockerfile.* / *.Dockerfile / Makefile.*`** (например `Dockerfile.vllm`).
 - Исключает: `.git .venv venv __pycache__ node_modules outputs artifacts checkpoints models .pytest_cache .mypy_cache .ruff_cache .DS_Store`, `*.csv *.parquet *.pkl *.pickle *.joblib *.db *.zip *.tgz *.tar *.gz *.pt *.pth *.ckpt *.safetensors *.onnx`, и `data/*.json` `data/*.npz`.
 - Точечно исключить файл — `--exclude path/relative/to/project`.
@@ -53,7 +53,7 @@
 
 1. **Не делать burst-вызовы** (`./culab status JID` в цикле без sleep). JupyterHub-фронт прячет за Yandex anti-bot — поймаешь `tmgrdfrend/showcaptcha` и придётся переэкспортировать cookies. Если опрашиваешь длинный job — `sleep 5` или больше между опросами. Throttle на 0.6с уже встроен, но это нижняя граница.
 2. **Никогда `./culab cleanup --all`** — этой опции нет специально. Чужие терминалы (`ours: false`) могут быть твоими собственными активными сессиями. Удаляй только по точному имени или `--ours`.
-3. **Не запускай старые скрипты прямого WS-вывода** (`./remote-run` через `python3 jupyter_terminal_exec.py`) — они засоряют твой контекст PTY-мусором.
+3. **Не пиши прямые WebSocket-вызовы**, не вызывай `python3 jupyter_terminal_exec.py` руками — PTY-мусор зальёт контекст.
 4. **Не читай большие логи целиком**. Всегда `--tail` или `--grep`.
 
 ## Восстановление после ошибок
@@ -111,10 +111,7 @@ echo "$JID" > /tmp/current-job
 
 ## Что под капотом (если очень нужно)
 
-- `culab` — bash wrapper над `culab_rpc.py`.
-- `culab_rpc.py` — клиент. Держит `RpcSession` (один WebSocket на серию вызовов), кэширует имя терминала в `~/.cache/culab/rpc.json`, делает throttle, retry, авто-cleanup мёртвых терминалов.
+- `culab` — bash-обёртка над `culab_rpc.py`.
+- `culab_rpc.py` — клиент. Держит `RpcSession` (один WebSocket на серию вызовов), кэширует имя терминала в `~/.cache/culab/rpc.json`, делает throttle, retry, авто-cleanup мёртвых терминалов. Логика фильтра push (`_should_include`, `_make_tarball`) тоже здесь.
 - `culab_rpc_server.py` — серверный демон. Загружается inline через `exec python3 -c "exec(b64decode(...))"`; никаких файлов на сервере не создаётся для bootstrap.
 - `jupyter_terminal_exec.py` — низкоуровневый WS-handshake, cookie-auth, framing. Не дёргай напрямую.
-- `remote_push_code.py` — фильтр содержимого тарбола (`should_include`). Используется как библиотека внутри `./culab push`.
-
-Старые `./remote-run`, `./push-*` теперь просто тонкие шапки над `./culab` — оставлены для привычки.

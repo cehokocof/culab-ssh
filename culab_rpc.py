@@ -33,11 +33,14 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io as _io
 import json
 import os
 import shlex
 import socket
 import sys
+import tarfile
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -57,6 +60,72 @@ from jupyter_terminal_exec import (
 SERVER_SCRIPT = Path(__file__).resolve().parent / "culab_rpc_server.py"
 STATE_DIR = Path.home() / ".cache" / "culab"
 STATE_FILE = STATE_DIR / "rpc.json"
+
+# Filter for `push`: what goes into the code-only tarball.
+_EXCLUDE_PARTS = {
+    ".git", ".venv", ".venv-vllm", "venv", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store",
+    "node_modules", "outputs", "artifacts", "checkpoints", "models",
+}
+_EXCLUDE_SUFFIXES = {
+    ".csv", ".parquet", ".pkl", ".pickle", ".joblib", ".db",
+    ".zip", ".tgz", ".tar", ".gz",
+    ".pt", ".pth", ".ckpt", ".safetensors", ".onnx",
+}
+_INCLUDE_SUFFIXES = {
+    ".py", ".ipynb", ".toml", ".lock", ".md", ".txt",
+    ".yaml", ".yml", ".json", ".ini", ".cfg", ".sh",
+}
+_INCLUDE_NAMES = {".gitignore", ".dockerignore", ".python-version", "Dockerfile", "Makefile"}
+_INCLUDE_STEMS = {"Dockerfile", "Makefile"}
+
+
+def _should_include(path: Path, root: Path, exclude_paths: set[str] | None) -> bool:
+    rel = path.relative_to(root)
+    if exclude_paths and rel.as_posix() in exclude_paths:
+        return False
+    if any(part in _EXCLUDE_PARTS for part in rel.parts):
+        return False
+    if rel.parts and rel.parts[0] == "data" and path.suffix in {".json", ".npz"}:
+        return False
+    if path.is_dir():
+        return False
+    if path.name in _INCLUDE_NAMES:
+        return True
+    if any(
+        path.name.startswith(f"{stem}.") or path.name.endswith(f".{stem}")
+        for stem in _INCLUDE_STEMS
+    ):
+        return True
+    if path.suffix in _EXCLUDE_SUFFIXES:
+        return False
+    return path.suffix in _INCLUDE_SUFFIXES
+
+
+def _make_tarball(root: Path, exclude_paths: set[str] | None = None) -> Path:
+    fd, name = tempfile.mkstemp(prefix=f"{root.name}-code-", suffix=".tgz")
+    os.close(fd)
+    archive = Path(name)
+    count = 0
+    manifest: list[tuple[str, str]] = []
+    with tarfile.open(archive, "w:gz") as tar:
+        for path in sorted(root.rglob("*")):
+            if _should_include(path, root, exclude_paths):
+                rel = path.relative_to(root).as_posix()
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                manifest.append((digest, rel))
+                tar.add(path, arcname=rel)
+                count += 1
+        manifest_text = "".join(f"{digest}  {rel}\n" for digest, rel in manifest)
+        manifest_bytes = manifest_text.encode("utf-8")
+        info = tarfile.TarInfo(".codex_push_manifest.sha256")
+        info.size = len(manifest_bytes)
+        info.mode = 0o644
+        tar.addfile(info, _io.BytesIO(manifest_bytes))
+    if count == 0:
+        archive.unlink(missing_ok=True)
+        raise SystemExit("no code files matched include rules")
+    return archive
 
 RESP_PREFIX = "__CULAB__"
 RESP_SUFFIX = "__END__"
@@ -379,16 +448,11 @@ def _cleanup_terminals(scope: str, name: str | None = None) -> dict:
 
 def _push(local_project: Path, remote_project: str, excludes: list[str]) -> dict:
     """Build code tarball locally, upload via one RPC session, extract + verify."""
-    import contextlib
-    import io as _io
-    from remote_push_code import make_tarball  # reuse should_include + manifest
-
     root = local_project.expanduser().resolve()
     if not root.is_dir():
         raise SystemExit(f"not a directory: {root}")
     exclude_paths = {Path(item).as_posix().lstrip("/") for item in excludes}
-    with contextlib.redirect_stdout(_io.StringIO()):
-        archive = make_tarball(root, exclude_paths)
+    archive = _make_tarball(root, exclude_paths)
     try:
         data = archive.read_bytes()
         sha = hashlib.sha256(data).hexdigest()
