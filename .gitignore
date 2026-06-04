@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Чувствительное: браузерные cookies
+cookies.json
+
+# Артефакты пушей (fallback архивы, большие тарболы)
+*.tgz
+*.tar
+*.tar.gz

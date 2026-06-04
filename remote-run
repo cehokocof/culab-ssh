@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+HUB_URL="${HUB_URL:-https://jupyter.culab.ru}" python3 jupyter_terminal_exec.py "$@"
