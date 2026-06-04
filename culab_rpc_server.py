@@ -17,6 +17,7 @@ Operations:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import signal
@@ -132,6 +133,45 @@ def _list_jobs(_req: dict) -> dict:
     return {"jobs": rows}
 
 
+def _upload_chunk(req: dict) -> dict:
+    """Offset-positioned write so retried chunks are idempotent.
+
+    The client sends `offset`; the server seeks there and writes. If the same
+    chunk arrives twice (network retry), the second write lands on the same
+    bytes and the file stays correct.
+    """
+    path = req["path"]
+    data = base64.b64decode(req["data_b64"])
+    offset = int(req.get("offset", 0))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if req.get("first") and offset == 0:
+        with open(path, "wb"):
+            pass
+    with open(path, "r+b") as f:
+        f.seek(offset)
+        f.write(data)
+    out: dict = {"ok": True, "bytes": os.path.getsize(path)}
+    if req.get("last"):
+        expected_size = req.get("expected_size")
+        if expected_size is not None and out["bytes"] != int(expected_size):
+            with open(path, "r+b") as f:
+                f.truncate(int(expected_size))
+            out["bytes"] = os.path.getsize(path)
+        expected = req.get("sha256")
+        if expected:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            got = h.hexdigest()
+            if got != expected:
+                return {"error": "sha256_mismatch", "expected": expected, "got": got, "size": out["bytes"]}
+            out["sha256"] = got
+    return out
+
+
 def _reap(req: dict) -> dict:
     jid = req["job_id"]
     JOBS.pop(jid, None)
@@ -149,6 +189,7 @@ HANDLERS = {
     "kill": _kill,
     "list_jobs": _list_jobs,
     "reap": _reap,
+    "upload_chunk": _upload_chunk,
 }
 
 

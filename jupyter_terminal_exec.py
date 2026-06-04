@@ -131,6 +131,10 @@ def create_terminal(hub_url: str, base_path: str, items: list[dict]) -> str:
 
 
 def list_terminals(hub_url: str, base_path: str, items: list[dict]) -> list[str]:
+    return [item["name"] for item in list_terminals_detailed(hub_url, base_path, items)]
+
+
+def list_terminals_detailed(hub_url: str, base_path: str, items: list[dict]) -> list[dict]:
     jar = load_cookie_jar(items, hub_url)
     opener = build_opener(HTTPCookieProcessor(jar))
     req = Request(
@@ -140,7 +144,11 @@ def list_terminals(hub_url: str, base_path: str, items: list[dict]) -> list[str]
     )
     with opener.open(req, timeout=20) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    return [str(item["name"]) for item in payload if "name" in item]
+    return [
+        {"name": str(it["name"]), "last_activity": it.get("last_activity")}
+        for it in payload
+        if "name" in it
+    ]
 
 
 def delete_terminal(hub_url: str, base_path: str, items: list[dict], terminal_name: str) -> None:

@@ -14,20 +14,28 @@ CLI:
   culab_rpc.py kill   JOB_ID  [--signal SIGTERM]
   culab_rpc.py jobs
   culab_rpc.py reap   JOB_ID
+  culab_rpc.py push   LOCAL_PROJECT  REMOTE_PROJECT  [--exclude PATH]...
   culab_rpc.py reset                    (force new terminal + bootstrap)
+
+Captcha guard: WS connections are throttled (default 0.6s between handshakes,
+override via CULAB_MIN_INTERVAL). Multi-step ops like `push` reuse a single
+WS for all RPC calls instead of one-WS-per-call.
 
 Stdout for the model is intentionally minimal:
   - exec: decoded stdout to stdout, decoded stderr to stderr, exit code = remote rc
   - spawn: prints job_id
   - log:   decoded log bytes to stdout
   - status/jobs/ping: compact JSON
+  - push:  one summary line "pushed N files (S bytes) -> REMOTE"
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
+import shlex
 import socket
 import sys
 import time
@@ -36,8 +44,10 @@ from pathlib import Path
 
 from jupyter_terminal_exec import (
     create_terminal,
+    delete_terminal,
     discover_base_path,
     list_terminals,
+    list_terminals_detailed,
     load_cookie_items,
     ws_connect,
     ws_recv_text,
@@ -66,8 +76,24 @@ def _state_save(data: dict) -> None:
     STATE_FILE.write_text(json.dumps(data))
 
 
+_PTY_PIECE = int(os.environ.get("CULAB_PTY_PIECE", "65536"))
+_PTY_GAP = float(os.environ.get("CULAB_PTY_GAP", "0"))
+
+
 def _send_stdin(sock, text: str) -> None:
-    ws_send_text(sock, json.dumps(["stdin", text]))
+    """Send stdin via WS in pieces small enough to fit terminado's PTY buffer.
+
+    terminado on the server does os.write(master_fd, payload) which can short-
+    write on a full PTY buffer; the dropped tail closes the WS. Splitting
+    keeps every single write below the buffer high-watermark.
+    """
+    if len(text) <= _PTY_PIECE:
+        ws_send_text(sock, json.dumps(["stdin", text]))
+        return
+    for i in range(0, len(text), _PTY_PIECE):
+        ws_send_text(sock, json.dumps(["stdin", text[i : i + _PTY_PIECE]]))
+        if _PTY_GAP > 0:
+            time.sleep(_PTY_GAP)
 
 
 def _recv_envelope(sock, timeout: float, want_id: str | None = None) -> dict:
@@ -126,6 +152,15 @@ def _bootstrap_command() -> str:
     )
 
 
+def _safe_delete(hub_url: str, base_path: str, items: list[dict], name: str | None) -> None:
+    if not name:
+        return
+    try:
+        delete_terminal(hub_url, base_path, items, name)
+    except Exception:
+        pass
+
+
 def _connect(hub_url: str, items: list[dict]):
     base_path = discover_base_path(items)
     state = _state_load()
@@ -135,7 +170,11 @@ def _connect(hub_url: str, items: list[dict]):
             sock = ws_connect(hub_url, base_path, terminal_name, items)
             return sock, base_path, terminal_name, True
         except Exception:
-            terminal_name = None
+            # Saved terminal is dead. Best-effort delete it before creating
+            # a replacement, so we do not leave a zombie in Jupyter UI.
+            _safe_delete(hub_url, base_path, items, terminal_name)
+            state.pop("terminal", None)
+            _state_save(state)
     terminal_name = create_terminal(hub_url, base_path, items)
     sock = ws_connect(hub_url, base_path, terminal_name, items)
     return sock, base_path, terminal_name, False
@@ -151,55 +190,260 @@ def _ensure_daemon(sock, base_path: str, terminal_name: str) -> None:
         return
     except TimeoutError:
         pass
-    _send_stdin(sock, "\x03\rstty sane\rstty -echo\r")
+    # -icanon is critical: canonical mode caps a single read at MAX_CANON
+    # (4096 on Linux), so any RPC request larger than ~4 KB would have its
+    # tail silently dropped and Python would wait forever for the missing
+    # newline. -echo just keeps PTY from echoing our JSON back as noise.
+    _send_stdin(sock, "\x03\rstty sane\rstty -echo -icanon\r")
     _drain(sock, 0.6)
     _send_stdin(sock, _bootstrap_command() + "\r")
     boot_id = uuid.uuid4().hex
     _send_stdin(sock, json.dumps({"op": "ping", "id": boot_id}) + "\n")
     _recv_envelope(sock, timeout=8.0, want_id=boot_id)
+    _drain(sock, 0.2)  # eat any trailing \r\n from PTY echo
     _state_save({"base_path": base_path, "terminal": terminal_name})
 
 
-def _call_once(req: dict, timeout: float) -> dict:
-    hub_url = os.environ.get("HUB_URL", "https://jupyter.culab.ru")
-    items = load_cookie_items(Path(os.environ.get("COOKIES_JSON", "cookies.json")))
-    sock, base_path, terminal_name, _ = _connect(hub_url, items)
-    try:
-        _ensure_daemon(sock, base_path, terminal_name)
-        req_id = uuid.uuid4().hex
-        req_with_id = {**req, "id": req_id}
-        _send_stdin(sock, json.dumps(req_with_id) + "\n")
-        return _recv_envelope(sock, timeout=timeout, want_id=req_id)
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
+_RECOVERABLE = (EOFError, TimeoutError, ConnectionError, socket.error)
+
+
+def _is_recoverable(exc: BaseException) -> bool:
+    if isinstance(exc, _RECOVERABLE):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return "websocket" in msg or "socket" in msg or "daemon" in msg
+    return False
+
+
+def _throttle() -> None:
+    """Sleep so consecutive WS handshakes stay below captcha rate."""
+    min_interval = float(os.environ.get("CULAB_MIN_INTERVAL", "0.6"))
+    state = _state_load()
+    last = float(state.get("last_connect", 0.0))
+    delta = time.time() - last
+    if delta < min_interval:
+        time.sleep(min_interval - delta)
+
+
+def _mark_connect() -> None:
+    state = _state_load()
+    state["last_connect"] = time.time()
+    _state_save(state)
+
+
+class RpcSession:
+    """Holds one WS for many RPC calls. Use as a context manager.
+
+    For one-shot calls just use `_call(req)`. For multi-step ops (upload many
+    chunks, then exec extract) wrap them all in a single `with RpcSession()`
+    block so they share one WS handshake.
+    """
+
+    def __init__(self) -> None:
+        self.sock = None
+        self.base_path: str | None = None
+        self.terminal_name: str | None = None
+        self._hub_url = os.environ.get("HUB_URL", "https://jupyter.culab.ru")
+        self._items = load_cookie_items(
+            Path(os.environ.get("COOKIES_JSON", "cookies.json"))
+        )
+
+    def __enter__(self) -> "RpcSession":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def _open(self) -> None:
+        if self.sock is not None:
+            return
+        _throttle()
+        self.sock, self.base_path, self.terminal_name, _reused = _connect(
+            self._hub_url, self._items
+        )
+        _mark_connect()
+        _ensure_daemon(self.sock, self.base_path, self.terminal_name)
+
+    def call(self, req: dict, *, timeout: float = 180.0) -> dict:
+        max_attempts = int(os.environ.get("CULAB_MAX_ATTEMPTS", "3"))
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                self._open()
+                req_id = uuid.uuid4().hex
+                _send_stdin(self.sock, json.dumps({**req, "id": req_id}) + "\n")
+                return _recv_envelope(self.sock, timeout=timeout, want_id=req_id)
+            except BaseException as exc:
+                if attempts >= max_attempts or not _is_recoverable(exc):
+                    raise
+                # Recovery: close our WS, delete the (likely-broken) terminal
+                # we created, and let _open() create a fresh one. Other
+                # terminals (the user's own ones) are never touched.
+                self.close()
+                state = _state_load()
+                stale = state.get("terminal")
+                if stale is not None and self.base_path is not None:
+                    _safe_delete(self._hub_url, self.base_path, self._items, stale)
+                    state.pop("terminal", None)
+                    _state_save(state)
+                self.terminal_name = None
+                self.base_path = None
+                time.sleep(0.4)
 
 
 def _call(req: dict, *, timeout: float = 180.0) -> dict:
-    try:
-        return _call_once(req, timeout)
-    except (RuntimeError, TimeoutError) as exc:
-        msg = str(exc)
-        recoverable = "websocket closed" in msg or "no daemon response" in msg
-        if not recoverable:
-            raise
-        if STATE_FILE.exists():
-            STATE_FILE.unlink()
-        time.sleep(0.4)
-        return _call_once(req, timeout)
+    with RpcSession() as s:
+        return s.call(req, timeout=timeout)
 
 
 def _without_id(d: dict) -> dict:
     return {k: v for k, v in d.items() if k != "id"}
 
 
+def _hub_and_items() -> tuple[str, list[dict], str]:
+    hub_url = os.environ.get("HUB_URL", "https://jupyter.culab.ru")
+    items = load_cookie_items(Path(os.environ.get("COOKIES_JSON", "cookies.json")))
+    base_path = discover_base_path(items)
+    return hub_url, items, base_path
+
+
 def _reset() -> dict:
-    """Drop cached terminal so the next call creates a fresh one."""
+    """Drop cached terminal AND best-effort delete it on the server.
+
+    Only deletes the terminal we created (the one stored in our state). The
+    user's own Jupyter terminals are never touched.
+    """
+    state = _state_load()
+    saved = state.get("terminal")
+    if saved is not None:
+        try:
+            hub_url, items, base_path = _hub_and_items()
+            _safe_delete(hub_url, base_path, items, saved)
+        except Exception:
+            pass
     if STATE_FILE.exists():
         STATE_FILE.unlink()
-    return {"ok": True}
+    return {"ok": True, "removed_terminal": saved}
+
+
+def _list_terminals() -> dict:
+    hub_url, items, base_path = _hub_and_items()
+    rows = list_terminals_detailed(hub_url, base_path, items)
+    ours = _state_load().get("terminal")
+    return {
+        "ours": ours,
+        "terminals": [
+            {"name": r["name"], "ours": r["name"] == ours, "last_activity": r["last_activity"]}
+            for r in rows
+        ],
+    }
+
+
+def _cleanup_terminals(scope: str, name: str | None = None) -> dict:
+    """Safe deletion of terminals.
+
+    scope='ours' deletes the saved-as-ours terminal only.
+    scope='name' deletes a single named terminal (caller's choice).
+    scope='all' is rejected — too risky, would kill the user's own sessions.
+    """
+    hub_url, items, base_path = _hub_and_items()
+    state = _state_load()
+    if scope == "all":
+        return {"error": "refused", "reason": "all would kill user terminals too; use --name or --ours"}
+    if scope == "ours":
+        target = state.get("terminal")
+        if not target:
+            return {"ok": True, "removed": [], "note": "no ours saved"}
+    elif scope == "name":
+        if not name:
+            return {"error": "name_required"}
+        target = name
+    else:
+        return {"error": "bad_scope"}
+    _safe_delete(hub_url, base_path, items, target)
+    if state.get("terminal") == target:
+        state.pop("terminal", None)
+        _state_save(state)
+    return {"ok": True, "removed": [target]}
+
+
+def _push(local_project: Path, remote_project: str, excludes: list[str]) -> dict:
+    """Build code tarball locally, upload via one RPC session, extract + verify."""
+    import contextlib
+    import io as _io
+    from remote_push_code import make_tarball  # reuse should_include + manifest
+
+    root = local_project.expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"not a directory: {root}")
+    exclude_paths = {Path(item).as_posix().lstrip("/") for item in excludes}
+    with contextlib.redirect_stdout(_io.StringIO()):
+        archive = make_tarball(root, exclude_paths)
+    try:
+        data = archive.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        # After `stty -icanon` MAX_CANON limit is gone; chunks can be large.
+        chunk_size = int(os.environ.get("CULAB_CHUNK", str(256 * 1024)))
+        chunk_timeout = float(os.environ.get("CULAB_CHUNK_TIMEOUT", "10"))
+        chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
+        remote_archive = f"/tmp/{root.name}-code.tgz"
+        show_progress = sys.stderr.isatty() or os.environ.get("CULAB_PROGRESS")
+
+        with RpcSession() as s:
+            for idx, chunk in enumerate(chunks):
+                req = {
+                    "op": "upload_chunk",
+                    "path": remote_archive,
+                    "data_b64": base64.b64encode(chunk).decode(),
+                    "offset": idx * chunk_size,
+                    "first": idx == 0,
+                    "last": idx == len(chunks) - 1,
+                }
+                if idx == len(chunks) - 1:
+                    req["sha256"] = sha
+                    req["expected_size"] = len(data)
+                resp = s.call(req, timeout=chunk_timeout)
+                if "error" in resp:
+                    raise RuntimeError(f"upload chunk {idx + 1}/{len(chunks)}: {resp}")
+                if show_progress:
+                    sys.stderr.write(f"\rchunk {idx + 1}/{len(chunks)}")
+                    sys.stderr.flush()
+            if show_progress:
+                sys.stderr.write("\n")
+
+            extract = (
+                f"mkdir -p {shlex.quote(remote_project)} && "
+                f"tar --overwrite --touch -xzf {shlex.quote(remote_archive)} "
+                f"-C {shlex.quote(remote_project)} && "
+                f"rm -f {shlex.quote(remote_archive)} && "
+                f"cd {shlex.quote(remote_project)} && "
+                f"sha256sum -c .codex_push_manifest.sha256 > /dev/null && "
+                f"wc -l < .codex_push_manifest.sha256"
+            )
+            resp = s.call({"op": "exec", "cmd": extract, "timeout": 180}, timeout=200)
+            if resp.get("rc") != 0:
+                err = base64.b64decode(resp.get("stderr_b64", "")).decode("utf-8", "replace")
+                raise RuntimeError(f"extract failed rc={resp.get('rc')}: {err.strip()}")
+            count = base64.b64decode(resp["stdout_b64"]).decode("utf-8", "replace").strip()
+        return {
+            "files": int(count),
+            "bytes": len(data),
+            "chunks": len(chunks),
+            "sha256": sha,
+            "remote": remote_project,
+        }
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def cli() -> int:
@@ -209,6 +453,12 @@ def cli() -> int:
     sub.add_parser("ping")
     sub.add_parser("reset")
     sub.add_parser("jobs")
+    sub.add_parser("terminals")
+
+    p_cleanup = sub.add_parser("cleanup")
+    g = p_cleanup.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ours", action="store_true", help="delete only the terminal we created")
+    g.add_argument("--name", help="delete one specific terminal by name")
 
     p_exec = sub.add_parser("exec")
     p_exec.add_argument("cmd")
@@ -231,6 +481,11 @@ def cli() -> int:
     p_kill = sub.add_parser("kill")
     p_kill.add_argument("job_id")
     p_kill.add_argument("--signal", default="SIGTERM")
+
+    p_push = sub.add_parser("push")
+    p_push.add_argument("local_project", type=Path)
+    p_push.add_argument("remote_project")
+    p_push.add_argument("--exclude", action="append", default=[])
 
     args = p.parse_args()
     op = args.op
@@ -293,6 +548,25 @@ def cli() -> int:
 
     if op == "reap":
         print(json.dumps(_without_id(_call({"op": "reap", "job_id": args.job_id}))))
+        return 0
+
+    if op == "terminals":
+        print(json.dumps(_list_terminals()))
+        return 0
+
+    if op == "cleanup":
+        if args.ours:
+            print(json.dumps(_cleanup_terminals("ours")))
+        else:
+            print(json.dumps(_cleanup_terminals("name", args.name)))
+        return 0
+
+    if op == "push":
+        info = _push(args.local_project, args.remote_project, args.exclude)
+        print(
+            f"pushed {info['files']} files ({info['bytes']} bytes, "
+            f"{info['chunks']} chunks) -> {info['remote']}"
+        )
         return 0
 
     return 1
